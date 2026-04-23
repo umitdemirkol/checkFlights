@@ -3,7 +3,7 @@ name: Check Flight Prices
 on:
   schedule:
     # Her 4 saatte bir çalışır (RapidAPI ücretsiz limit: 50 istek/ay)
-    - cron: '0 */4 * * *'
+    - cron: '0 */6 * * *'
   workflow_dispatch:
     inputs:
       reset_cache:

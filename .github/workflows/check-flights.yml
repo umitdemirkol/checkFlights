@@ -26,7 +26,9 @@ jobs:
       - name: Restore price cache
         uses: actions/cache@v4
         with:
-          path: price_cache.json
+          path: |
+            price_cache.json
+            notify_state.json
           key: flight-prices-${{ github.run_id }}
           restore-keys: |
             flight-prices-

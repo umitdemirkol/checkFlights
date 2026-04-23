@@ -11,6 +11,14 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 CACHE_FILE = "price_cache.json"
+STATE_FILE = "notify_state.json"
+
+INTRO_MESSAGE = """<b>✈️ SAW → BEG fiyat takibi başladı</b>
+
+Bu grupta İstanbul Sabiha Gökçen (SAW) → Belgrad (BEG) gidiş uçuşları izleniyor.
+Hedef: 30 Nisan 20:00 sonrası ve 1 Mayıs kalkışları.
+
+Her kontrolde fiyat değişirse ayrıntılı mesaj; değişmezse kısa “değişiklik yok” özeti gönderilir."""
 
 HEADERS = {
     "x-rapidapi-key": RAPIDAPI_KEY,
@@ -34,6 +42,18 @@ def send_telegram(message: str):
     })
     if not resp.ok:
         print(f"Telegram error: {resp.status_code} {resp.text}")
+
+
+def load_notify_state() -> dict:
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    return {"intro_sent": False}
+
+
+def save_notify_state(state: dict):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
 
 
 def search_flights_for_date(depart_date: str) -> list[dict]:
@@ -298,6 +318,15 @@ def main():
             f"   📅 {dep_display} | {old['price_formatted']}"
         )
 
+    notify_state = load_notify_state()
+    if not notify_state.get("intro_sent"):
+        send_telegram(INTRO_MESSAGE)
+        notify_state["intro_sent"] = True
+        save_notify_state(notify_state)
+        print("Sent one-time intro message to Telegram")
+
+    now = datetime.now(TURKEY_TZ).strftime("%d/%m %H:%M")
+
     if changes:
         summary = f"{len(target_flights)} uçuş takip ediliyor"
         msg = build_notification(changes, summary)
@@ -305,6 +334,12 @@ def main():
         send_telegram(msg)
     else:
         print("No price changes detected")
+        send_telegram(
+            "<b>✈️ SAW → BEG</b> — Kontrol tamamlandı.\n"
+            f"Fiyat / uçuş listesinde <b>değişiklik yok</b>.\n"
+            f"<i>{len(target_flights)} uçuş izleniyor.</i>\n\n"
+            f"🕐 {now}"
+        )
 
     save_cache(new_cache)
     print("Cache updated successfully")

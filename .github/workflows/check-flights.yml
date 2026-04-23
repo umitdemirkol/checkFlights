@@ -36,9 +36,9 @@ jobs:
             price_cache.json
             notify_state.json
           # Anahtar değişince eski cache kullanılmaz (temiz başlangıç)
-          key: saw-beg-tracker-v2-${{ github.run_id }}
+          key: flight-tracker-v3-${{ github.run_id }}
           restore-keys: |
-            saw-beg-tracker-v2-
+            flight-tracker-v3-
 
       - name: Clear flight cache (manual reset)
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.reset_cache }}

@@ -13,24 +13,31 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 CACHE_FILE = "price_cache.json"
 STATE_FILE = "notify_state.json"
 
-INTRO_MESSAGE = """<b>✈️ SAW → BEG fiyat takibi başladı</b>
-
-Bu grupta İstanbul Sabiha Gökçen (SAW) → Belgrad (BEG) gidiş uçuşları izleniyor.
-Hedef: 30 Nisan 20:00 sonrası ve 1 Mayıs kalkışları.
-
-Her kontrolde fiyat değişirse ayrıntılı mesaj; değişmezse kısa “değişiklik yok” özeti gönderilir."""
-
 HEADERS = {
     "x-rapidapi-key": RAPIDAPI_KEY,
     "x-rapidapi-host": RAPIDAPI_HOST,
     "Content-Type": "application/json",
 }
 
-ORIGIN = "SAW"
-DESTINATION = "BEG"
+ROUTES = [
+    {"from": "SAW", "to": "BEG", "label": "SAW → BEG (Belgrad)"},
+    {"from": "SAW", "to": "TZL", "label": "SAW → TZL (Tuzla/Saraybosna)"},
+]
+
 DEPART_DATES = ["2026-04-30", "2026-05-01"]
 
 TURKEY_TZ = timezone(timedelta(hours=3))
+
+INTRO_MESSAGE = """<b>✈️ Uçuş Fiyat Takibi başladı!</b>
+
+Takip edilen rotalar:
+• İstanbul SAW → Belgrad (BEG)
+• İstanbul SAW → Tuzla (TZL)
+
+Tarih: 30 Nisan 20:00 sonrası – 1 Mayıs
+Sadece <b>direkt</b> uçuşlar izleniyor.
+
+Her kontrolde durum bilgisi gönderilir."""
 
 
 def send_telegram(message: str):
@@ -56,12 +63,11 @@ def save_notify_state(state: dict):
         json.dump(state, f, indent=2)
 
 
-def search_flights_for_date(depart_date: str) -> list[dict]:
-    """Search one-way flights SAW -> BEG for a specific date."""
+def search_flights(origin: str, destination: str, depart_date: str) -> list[dict]:
     url = f"https://{RAPIDAPI_HOST}/web/flights/search-one-way"
     params = {
-        "placeIdFrom": ORIGIN,
-        "placeIdTo": DESTINATION,
+        "placeIdFrom": origin,
+        "placeIdTo": destination,
         "departDate": depart_date,
         "currency": "TRY",
         "market": "TR",
@@ -75,7 +81,7 @@ def search_flights_for_date(depart_date: str) -> list[dict]:
     data = resp.json()
 
     if not data.get("status"):
-        print(f"API error for {depart_date}: {json.dumps(data, indent=2)[:500]}")
+        print(f"  API error {origin}->{destination} {depart_date}: {json.dumps(data, indent=2)[:300]}")
         return []
 
     itineraries_data = data.get("data", {}).get("itineraries", {})
@@ -87,12 +93,10 @@ def search_flights_for_date(depart_date: str) -> list[dict]:
         if session_id:
             items = poll_incomplete(session_id, items)
 
-    print(f"  {depart_date}: found {len(items)} unique flights")
     return items
 
 
 def extract_items_from_buckets(itineraries_data: dict) -> list[dict]:
-    """Extract unique flight items from all buckets, deduplicating by ID."""
     seen_ids = set()
     items = []
     for bucket in itineraries_data.get("buckets", []):
@@ -105,58 +109,40 @@ def extract_items_from_buckets(itineraries_data: dict) -> list[dict]:
 
 
 def poll_incomplete(session_id: str, current_items: list[dict], max_retries: int = 3) -> list[dict]:
-    """Poll the incomplete endpoint until results are complete."""
     url = f"https://{RAPIDAPI_HOST}/web/flights/search-incomplete"
-
     for attempt in range(max_retries):
         time.sleep(3)
-        params = {"sessionId": session_id}
-        resp = requests.get(url, headers=HEADERS, params=params)
+        resp = requests.get(url, headers=HEADERS, params={"sessionId": session_id})
         if not resp.ok:
             print(f"  Incomplete poll failed: {resp.status_code}")
             break
-
         data = resp.json()
         if not data.get("status"):
             break
-
         itineraries_data = data.get("data", {}).get("itineraries", {})
         new_items = extract_items_from_buckets(itineraries_data)
-
         if new_items:
             current_items = new_items
-
-        context = itineraries_data.get("context", {})
-        if context.get("status") == "complete":
-            print(f"  Results complete after {attempt + 1} polls")
+        if itineraries_data.get("context", {}).get("status") == "complete":
+            print(f"  Complete after {attempt + 1} polls")
             break
-
     return current_items
 
 
-def search_all_flights() -> list[dict]:
-    """Search flights for all configured dates."""
-    all_items = []
-    for date in DEPART_DATES:
-        items = search_flights_for_date(date)
-        all_items.extend(items)
-        if date != DEPART_DATES[-1]:
-            time.sleep(2)
-    return all_items
-
-
-def filter_target_flights(items: list[dict]) -> list[dict]:
-    """Keep flights departing Apr 30 after 20:00 or anytime on May 1."""
+def filter_direct_target_flights(items: list[dict]) -> list[dict]:
+    """Keep only DIRECT flights departing Apr 30 20:00+ or May 1."""
     filtered = []
     for item in items:
         legs = item.get("legs", [])
         if not legs:
             continue
-
-        dep_str = legs[0].get("departure", "")
-        if not dep_str:
+        leg = legs[0]
+        if leg.get("stopCount", 99) != 0:
             continue
 
+        dep_str = leg.get("departure", "")
+        if not dep_str:
+            continue
         try:
             dep = datetime.fromisoformat(dep_str)
         except ValueError:
@@ -164,18 +150,32 @@ def filter_target_flights(items: list[dict]) -> list[dict]:
 
         is_apr30_evening = dep.month == 4 and dep.day == 30 and dep.hour >= 20
         is_may1 = dep.month == 5 and dep.day == 1
-
         if is_apr30_evening or is_may1:
             filtered.append(item)
 
     return filtered
 
 
+def search_route(route: dict) -> list[dict]:
+    """Search all dates for a route, return only direct target flights."""
+    origin, destination = route["from"], route["to"]
+    label = route["label"]
+    all_items = []
+
+    for date in DEPART_DATES:
+        items = search_flights(origin, destination, date)
+        all_items.extend(items)
+        print(f"  {label} {date}: {len(items)} flights")
+        time.sleep(2)
+
+    direct = filter_direct_target_flights(all_items)
+    print(f"  {label} direkt hedef uçuşlar: {len(direct)}")
+    return direct
+
+
 def extract_flight_info(item: dict) -> dict:
-    """Extract key fields from a flight item for comparison and display."""
     leg = item.get("legs", [{}])[0]
     price_obj = item.get("price", {})
-
     carriers = leg.get("carriers", {}).get("marketing", [])
     airline_names = [c.get("name", "?") for c in carriers]
     airline = " / ".join(airline_names) if airline_names else "Bilinmiyor"
@@ -218,128 +218,109 @@ def format_duration(minutes: int) -> str:
     return f"{h}s {m}dk" if h else f"{m}dk"
 
 
-def build_notification(changes: list[str], summary: str = "") -> str:
-    now = datetime.now(TURKEY_TZ).strftime("%d/%m %H:%M")
-    msg = "<b>✈️ SAW → BEG Uçuş Fiyat Takibi</b>\n"
-    if summary:
-        msg += f"<i>{summary}</i>\n"
-    msg += "\n"
-    msg += "\n\n".join(changes)
-    msg += f"\n\n🕐 Kontrol: {now}"
-    return msg
-
-
-def main():
-    print(f"[{datetime.now(TURKEY_TZ).isoformat()}] Checking flights...")
+def process_route(route: dict, cache: dict) -> tuple[list[str], dict, int]:
+    """Process a single route: compare with cache, return (changes, new_cache_entries, flight_count)."""
+    route_key_prefix = f"{route['from']}_{route['to']}"
 
     try:
-        all_items = search_all_flights()
+        flights = search_route(route)
     except requests.exceptions.RequestException as e:
-        print(f"API request failed: {e}")
-        send_telegram(f"⚠️ API hatası: {e}")
-        sys.exit(1)
+        print(f"API error for {route['label']}: {e}")
+        return [f"⚠️ {route['label']}: API hatası — {e}"], {}, 0
 
-    if not all_items:
-        print("No flights returned from API")
-        send_telegram("⚠️ API'den uçuş verisi alınamadı.")
-        sys.exit(0)
-
-    print(f"Total unique flights found: {len(all_items)}")
-
-    target_flights = filter_target_flights(all_items)
-    print(f"Target flights (Apr 30 20:00+ / May 1): {len(target_flights)}")
-
-    if not target_flights:
-        print("No flights match the time filter. Showing all flights for reference:")
-        for item in all_items:
-            info = extract_flight_info(item)
-            print(f"  {info['airline']} | {info['departure']} | {info['price_formatted']}")
-
-        target_flights = all_items
-        print("Using ALL flights since no evening flights exist yet")
-
-    cache = load_cache()
     changes = []
-    new_cache = {}
+    new_entries = {}
 
-    for item in target_flights:
+    for item in flights:
         info = extract_flight_info(item)
-        flight_key = f"{info['airline']}_{info['departure']}_{info['stops']}"
+        flight_key = f"{route_key_prefix}_{info['airline']}_{info['departure']}"
         old = cache.get(flight_key)
 
-        new_cache[flight_key] = {
+        new_entries[flight_key] = {
             "price": info["price"],
             "price_formatted": info["price_formatted"],
             "airline": info["airline"],
             "departure": info["departure"],
             "arrival": info["arrival"],
-            "stops": info["stops"],
             "duration": info["duration"],
             "last_checked": datetime.now(TURKEY_TZ).isoformat(),
         }
 
         dep_display = format_time(info["departure"])
         arr_display = format_time(info["arrival"])
-        stop_text = "Direkt" if info["stops"] == 0 else f"{info['stops']} aktarma"
         dur_text = format_duration(info["duration"])
 
         if old is None:
             changes.append(
-                f"🆕 <b>{info['airline']}</b>\n"
-                f"   📅 {dep_display} → {arr_display}\n"
-                f"   ⏱ {dur_text} | {stop_text}\n"
-                f"   💰 {info['price_formatted']}"
+                f"  🆕 <b>{info['airline']}</b>\n"
+                f"     📅 {dep_display} → {arr_display} | ⏱ {dur_text}\n"
+                f"     💰 {info['price_formatted']}"
             )
         elif old["price"] != info["price"]:
-            old_price = old["price"]
-            new_price = info["price"]
-            diff = new_price - old_price
-
+            diff = info["price"] - old["price"]
             if diff < 0:
-                icon = "📉 DÜŞTÜ"
+                icon = "📉"
                 diff_text = f"-{abs(diff):.0f} TL"
             else:
-                icon = "📈 ARTTI"
+                icon = "📈"
                 diff_text = f"+{diff:.0f} TL"
-
             changes.append(
-                f"{icon}: <b>{info['airline']}</b>\n"
-                f"   📅 {dep_display} → {arr_display}\n"
-                f"   ⏱ {dur_text} | {stop_text}\n"
-                f"   💰 {old['price_formatted']} → {info['price_formatted']} ({diff_text})"
+                f"  {icon} <b>{info['airline']}</b>\n"
+                f"     📅 {dep_display} → {arr_display} | ⏱ {dur_text}\n"
+                f"     💰 {old['price_formatted']} → {info['price_formatted']} ({diff_text})"
             )
 
-    removed = set(cache.keys()) - set(new_cache.keys())
+    old_route_keys = {k for k in cache if k.startswith(route_key_prefix + "_")}
+    removed = old_route_keys - set(new_entries.keys())
     for key in removed:
         old = cache[key]
         dep_display = format_time(old["departure"])
         changes.append(
-            f"❌ KALDIRILDI: <b>{old['airline']}</b>\n"
-            f"   📅 {dep_display} | {old['price_formatted']}"
+            f"  ❌ <b>{old['airline']}</b> — {dep_display} | {old['price_formatted']} KALDIRILDI"
         )
+
+    return changes, new_entries, len(flights)
+
+
+def main():
+    print(f"[{datetime.now(TURKEY_TZ).isoformat()}] Checking flights...")
 
     notify_state = load_notify_state()
     if not notify_state.get("intro_sent"):
         send_telegram(INTRO_MESSAGE)
         notify_state["intro_sent"] = True
         save_notify_state(notify_state)
-        print("Sent one-time intro message to Telegram")
+        print("Sent intro message")
+
+    cache = load_cache()
+    new_cache = {}
+    all_sections = []
+    total_flights = 0
+    has_changes = False
+
+    for route in ROUTES:
+        changes, new_entries, flight_count = process_route(route, cache)
+        new_cache.update(new_entries)
+        total_flights += flight_count
+
+        section_header = f"<b>{'—' * 20}</b>\n<b>✈️ {route['label']}</b>"
+
+        if changes:
+            has_changes = True
+            section = section_header + f"\n<i>{flight_count} direkt uçuş</i>\n\n" + "\n\n".join(changes)
+        else:
+            section = section_header + f"\n✅ Değişiklik yok ({flight_count} direkt uçuş)"
+
+        all_sections.append(section)
 
     now = datetime.now(TURKEY_TZ).strftime("%d/%m %H:%M")
 
-    if changes:
-        summary = f"{len(target_flights)} uçuş takip ediliyor"
-        msg = build_notification(changes, summary)
-        print(f"Sending notification with {len(changes)} changes")
-        send_telegram(msg)
-    else:
-        print("No price changes detected")
-        send_telegram(
-            "<b>✈️ SAW → BEG</b> — Kontrol tamamlandı.\n"
-            f"Fiyat / uçuş listesinde <b>değişiklik yok</b>.\n"
-            f"<i>{len(target_flights)} uçuş izleniyor.</i>\n\n"
-            f"🕐 {now}"
-        )
+    msg = "<b>✈️ Uçuş Fiyat Kontrol Raporu</b>\n\n"
+    msg += "\n\n".join(all_sections)
+    msg += f"\n\n{'—' * 20}\n🕐 Kontrol: {now} | Toplam: {total_flights} direkt uçuş"
+
+    print(f"Sending combined notification (changes: {has_changes})")
+    send_telegram(msg)
 
     save_cache(new_cache)
     print("Cache updated successfully")

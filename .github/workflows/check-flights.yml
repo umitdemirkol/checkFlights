@@ -5,6 +5,12 @@ on:
     # Her 4 saatte bir çalışır (RapidAPI ücretsiz limit: 50 istek/ay)
     - cron: '0 */4 * * *'
   workflow_dispatch:
+    inputs:
+      reset_cache:
+        description: "Önbelleği sıfırla (fiyat geçmişi + hoş geldin yeniden)"
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   check-prices:
@@ -29,9 +35,14 @@ jobs:
           path: |
             price_cache.json
             notify_state.json
-          key: flight-prices-${{ github.run_id }}
+          # Anahtar değişince eski cache kullanılmaz (temiz başlangıç)
+          key: saw-beg-tracker-v2-${{ github.run_id }}
           restore-keys: |
-            flight-prices-
+            saw-beg-tracker-v2-
+
+      - name: Clear flight cache (manual reset)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.reset_cache }}
+        run: rm -f price_cache.json notify_state.json
 
       - name: Check flight prices
         env:

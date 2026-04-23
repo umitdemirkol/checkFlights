@@ -1,0 +1,39 @@
+name: Check Flight Prices
+
+on:
+  schedule:
+    # Her 4 saatte bir çalışır (RapidAPI ücretsiz limit: 50 istek/ay)
+    - cron: '0 */4 * * *'
+  workflow_dispatch:
+
+jobs:
+  check-prices:
+    runs-on: ubuntu-latest
+    environment: UmidoKey
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore price cache
+        uses: actions/cache@v4
+        with:
+          path: price_cache.json
+          key: flight-prices-${{ github.run_id }}
+          restore-keys: |
+            flight-prices-
+
+      - name: Check flight prices
+        env:
+          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python src/check_flights.py

@@ -2,8 +2,8 @@ name: Check Flight Prices
 
 on:
   schedule:
-    # Her saat başı (UTC). ~2–6 RapidAPI isteği/çalıştırma (Kiwi + gerekirse Skyscanner yedek).
-    - cron: '0 * * * *'
+    # Her 2 saatte bir (UTC). Günde ~48 istek, aylık ~150 Google Flights kotasına uygun.
+    - cron: '0 */2 * * *'
   workflow_dispatch:
     inputs:
       reset_cache:
@@ -36,9 +36,9 @@ jobs:
             price_cache.json
             notify_state.json
           # Anahtar değişince eski cache kullanılmaz (temiz başlangıç)
-          key: flight-tracker-v6-${{ github.run_id }}
+          key: flight-tracker-v7-${{ github.run_id }}
           restore-keys: |
-            flight-tracker-v6-
+            flight-tracker-v7-
 
       - name: Clear flight cache (manual reset)
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.reset_cache }}

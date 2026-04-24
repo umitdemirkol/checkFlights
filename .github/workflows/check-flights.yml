@@ -36,9 +36,9 @@ jobs:
             price_cache.json
             notify_state.json
           # Anahtar değişince eski cache kullanılmaz (temiz başlangıç)
-          key: flight-tracker-v5-${{ github.run_id }}
+          key: flight-tracker-v6-${{ github.run_id }}
           restore-keys: |
-            flight-tracker-v5-
+            flight-tracker-v6-
 
       - name: Clear flight cache (manual reset)
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.reset_cache }}

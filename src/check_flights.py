@@ -174,6 +174,13 @@ def parse_kiwi_flights(route: dict, data: dict) -> list[dict]:
         if not dep_s:
             continue
 
+        try:
+            dep_dt = datetime.fromisoformat(dep_s)
+        except ValueError:
+            continue
+        if dep_dt.month != 5:
+            continue
+
         carrier = (seg.get("carrier") or {}).get("name") or "?"
 
         price_amt = it.get("price", {}).get("amount")

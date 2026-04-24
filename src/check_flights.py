@@ -1,43 +1,59 @@
+"""
+SAW -> BEG / TZL uçuş takibi.
+Birincil: Kiwi.com Cheap Flights (RapidAPI) — rezervasyon linki bookingUrl.
+Yedek: Flights Scraper Sky — Kiwi yanıtı hedef tarihlere uymazsa (bilinen API davranışı).
+Her çalışmada tüm bulunan direkt uçuşlar Telegram'a gider; fiyat önceki kontrole göre işaretlenir.
+"""
 import os
 import json
 import sys
 import time
 import requests
 from datetime import datetime, timezone, timedelta
+from urllib.parse import quote
 
 RAPIDAPI_KEY = os.environ["RAPIDAPI_KEY"]
-RAPIDAPI_HOST = "flights-sky.p.rapidapi.com"
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 CACHE_FILE = "price_cache.json"
 STATE_FILE = "notify_state.json"
 
-HEADERS = {
-    "x-rapidapi-key": RAPIDAPI_KEY,
-    "x-rapidapi-host": RAPIDAPI_HOST,
-    "Content-Type": "application/json",
-}
-
-ROUTES = [
-    {"from": "SAW", "to": "BEG", "label": "SAW → BEG (Belgrad)"},
-    {"from": "SAW", "to": "TZL", "label": "SAW → TZL (Tuzla/Saraybosna)"},
-]
-
-DEPART_DATES = ["2026-04-30", "2026-05-01"]
+KIWI_HOST = "kiwi-com-cheap-flights.p.rapidapi.com"
+SKY_HOST = "flights-sky.p.rapidapi.com"
 
 TURKEY_TZ = timezone(timedelta(hours=3))
 
-INTRO_MESSAGE = """<b>✈️ Uçuş Fiyat Takibi başladı!</b>
+ROUTES = [
+    {"from": "SAW", "to": "BEG", "label": "SAW → BEG (Belgrad)", "kiwi_dest_slug": "belgrade-serbia"},
+    {"from": "SAW", "to": "TZL", "label": "SAW → TZL (Tuzla)", "kiwi_dest_slug": "tuzla-bosnia-and-herzegovina"},
+]
 
-Takip edilen rotalar:
-• İstanbul SAW → Belgrad (BEG)
-• İstanbul SAW → Tuzla (TZL)
+DEPART_DATE_FROM = "2026-04-30"
+DEPART_DATE_TO = "2026-05-01"
+DEPART_DATES = ["2026-04-30", "2026-05-01"]
 
-Tarih: 30 Nisan 20:00 sonrası – 1 Mayıs
-Sadece <b>direkt</b> uçuşlar izleniyor.
+TELEGRAM_MAX = 3900
 
-Her kontrolde durum bilgisi gönderilir."""
+INTRO_MESSAGE = """<b>Uçuş fiyat takibi (Kiwi + yedek Skyscanner)</b>
+
+Rotalar: SAW → BEG, SAW → TZL
+Tarih penceresi: 30 Nisan 20:00 sonrası ve 1 Mayıs (yerel saat)
+Sadece <b>direkt</b> uçuşlar.
+
+Her saat tam liste gönderilir; mümkünse <b>Kiwi.com</b> rezervasyon linki eklenir."""
+
+HEADERS_KIWI = {
+    "x-rapidapi-key": RAPIDAPI_KEY,
+    "x-rapidapi-host": KIWI_HOST,
+    "Content-Type": "application/json",
+}
+
+HEADERS_SKY = {
+    "x-rapidapi-key": RAPIDAPI_KEY,
+    "x-rapidapi-host": SKY_HOST,
+    "Content-Type": "application/json",
+}
 
 
 def send_telegram(message: str):
@@ -46,9 +62,28 @@ def send_telegram(message: str):
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
         "parse_mode": "HTML",
+        "disable_web_page_preview": True,
     })
     if not resp.ok:
         print(f"Telegram error: {resp.status_code} {resp.text}")
+
+
+def send_telegram_long(text: str):
+    """Telegram 4096 limit; split on newlines."""
+    parts = []
+    buf = ""
+    for line in text.split("\n"):
+        if len(buf) + len(line) + 1 > TELEGRAM_MAX:
+            parts.append(buf)
+            buf = line
+        else:
+            buf = (buf + "\n" + line) if buf else line
+    if buf:
+        parts.append(buf)
+    for i, p in enumerate(parts):
+        if len(parts) > 1:
+            p = f"<i>({i + 1}/{len(parts)})</i>\n" + p
+        send_telegram(p)
 
 
 def load_notify_state() -> dict:
@@ -63,135 +98,6 @@ def save_notify_state(state: dict):
         json.dump(state, f, indent=2)
 
 
-def search_flights(origin: str, destination: str, depart_date: str) -> list[dict]:
-    url = f"https://{RAPIDAPI_HOST}/web/flights/search-one-way"
-    params = {
-        "placeIdFrom": origin,
-        "placeIdTo": destination,
-        "departDate": depart_date,
-        "currency": "TRY",
-        "market": "TR",
-        "locale": "tr-TR",
-        "cabinClass": "economy",
-        "adults": "1",
-    }
-
-    resp = requests.get(url, headers=HEADERS, params=params)
-    resp.raise_for_status()
-    data = resp.json()
-
-    if not data.get("status"):
-        print(f"  API error {origin}->{destination} {depart_date}: {json.dumps(data, indent=2)[:300]}")
-        return []
-
-    itineraries_data = data.get("data", {}).get("itineraries", {})
-    items = extract_items_from_buckets(itineraries_data)
-
-    context = itineraries_data.get("context", {})
-    if context.get("status") == "incomplete":
-        session_id = context.get("sessionId", "")
-        if session_id:
-            items = poll_incomplete(session_id, items)
-
-    return items
-
-
-def extract_items_from_buckets(itineraries_data: dict) -> list[dict]:
-    seen_ids = set()
-    items = []
-    for bucket in itineraries_data.get("buckets", []):
-        for item in bucket.get("items", []):
-            item_id = item.get("id", "")
-            if item_id and item_id not in seen_ids:
-                seen_ids.add(item_id)
-                items.append(item)
-    return items
-
-
-def poll_incomplete(session_id: str, current_items: list[dict], max_retries: int = 3) -> list[dict]:
-    url = f"https://{RAPIDAPI_HOST}/web/flights/search-incomplete"
-    for attempt in range(max_retries):
-        time.sleep(3)
-        resp = requests.get(url, headers=HEADERS, params={"sessionId": session_id})
-        if not resp.ok:
-            print(f"  Incomplete poll failed: {resp.status_code}")
-            break
-        data = resp.json()
-        if not data.get("status"):
-            break
-        itineraries_data = data.get("data", {}).get("itineraries", {})
-        new_items = extract_items_from_buckets(itineraries_data)
-        if new_items:
-            current_items = new_items
-        if itineraries_data.get("context", {}).get("status") == "complete":
-            print(f"  Complete after {attempt + 1} polls")
-            break
-    return current_items
-
-
-def filter_direct_target_flights(items: list[dict]) -> list[dict]:
-    """Keep only DIRECT flights departing Apr 30 20:00+ or May 1."""
-    filtered = []
-    for item in items:
-        legs = item.get("legs", [])
-        if not legs:
-            continue
-        leg = legs[0]
-        if leg.get("stopCount", 99) != 0:
-            continue
-
-        dep_str = leg.get("departure", "")
-        if not dep_str:
-            continue
-        try:
-            dep = datetime.fromisoformat(dep_str)
-        except ValueError:
-            continue
-
-        is_apr30_evening = dep.month == 4 and dep.day == 30 and dep.hour >= 20
-        is_may1 = dep.month == 5 and dep.day == 1
-        if is_apr30_evening or is_may1:
-            filtered.append(item)
-
-    return filtered
-
-
-def search_route(route: dict) -> list[dict]:
-    """Search all dates for a route, return only direct target flights."""
-    origin, destination = route["from"], route["to"]
-    label = route["label"]
-    all_items = []
-
-    for date in DEPART_DATES:
-        items = search_flights(origin, destination, date)
-        all_items.extend(items)
-        print(f"  {label} {date}: {len(items)} flights")
-        time.sleep(2)
-
-    direct = filter_direct_target_flights(all_items)
-    print(f"  {label} direkt hedef uçuşlar: {len(direct)}")
-    return direct
-
-
-def extract_flight_info(item: dict) -> dict:
-    leg = item.get("legs", [{}])[0]
-    price_obj = item.get("price", {})
-    carriers = leg.get("carriers", {}).get("marketing", [])
-    airline_names = [c.get("name", "?") for c in carriers]
-    airline = " / ".join(airline_names) if airline_names else "Bilinmiyor"
-
-    return {
-        "id": item.get("id", ""),
-        "price": price_obj.get("raw", 0),
-        "price_formatted": price_obj.get("formatted", "N/A"),
-        "airline": airline,
-        "departure": leg.get("departure", ""),
-        "arrival": leg.get("arrival", ""),
-        "duration": leg.get("durationInMinutes", 0),
-        "stops": leg.get("stopCount", 0),
-    }
-
-
 def load_cache() -> dict:
     if os.path.exists(CACHE_FILE):
         with open(CACHE_FILE) as f:
@@ -204,127 +110,388 @@ def save_cache(cache: dict):
         json.dump(cache, f, indent=2, ensure_ascii=False)
 
 
-def format_time(iso_str: str) -> str:
-    try:
-        dt = datetime.fromisoformat(iso_str)
-        months = {4: "Nis", 5: "May"}
-        return f"{dt.day} {months.get(dt.month, '')} {dt.hour:02d}:{dt.minute:02d}"
-    except (ValueError, AttributeError):
-        return iso_str
+def in_target_departure_window(dep: datetime) -> bool:
+    """30 Nisan 20:00+ veya 1 Mayıs (yerel kalkış saati)."""
+    if dep.tzinfo is None:
+        dep = dep.replace(tzinfo=TURKEY_TZ)
+    d = dep.astimezone(TURKEY_TZ)
+    if d.month == 4 and d.day == 30 and d.hour >= 20:
+        return True
+    if d.month == 5 and d.day == 1:
+        return True
+    return False
 
 
-def format_duration(minutes: int) -> str:
-    h, m = divmod(minutes, 60)
+def format_time_dt(d: datetime) -> str:
+    months = {4: "Nis", 5: "May"}
+    dd = d.astimezone(TURKEY_TZ)
+    return f"{dd.day} {months.get(dd.month, '')} {dd.hour:02d}:{dd.minute:02d}"
+
+
+def format_duration_minutes(mins: int) -> str:
+    h, m = divmod(mins, 60)
     return f"{h}s {m}dk" if h else f"{m}dk"
 
 
-def process_route(route: dict, cache: dict) -> tuple[list[str], dict, int]:
-    """Process a single route: compare with cache, return (changes, new_cache_entries, flight_count)."""
-    route_key_prefix = f"{route['from']}_{route['to']}"
+def fallback_kiwi_search_url(route: dict, dep_local: datetime) -> str:
+    """Kiwi arama sayfası (derin link yoksa)."""
+    dd = dep_local.astimezone(TURKEY_TZ)
+    slug = route["kiwi_dest_slug"]
+    # Kiwi tarih-saat path biçimi (yaklaşık)
+    dt_part = f"{dd.year}-{dd.month:02d}-{dd.day:02d}-{dd.hour:02d}:{dd.minute:02d}"
+    return (
+        "https://www.kiwi.com/tr/search/tickets/"
+        f"sabiha-gokcen-sabiha-tr/{slug}/{dt_part}/no-return"
+    )
 
+
+# --- Kiwi API ---
+
+def search_kiwi_route(route: dict) -> dict:
+    url = f"https://{KIWI_HOST}/one-way"
+    params = {
+        "source": f"Airport:{route['from']}",
+        "destination": f"Airport:{route['to']}",
+        "currency": "TRY",
+        "locale": "tr",
+        "adults": "1",
+        "children": "0",
+        "infants": "0",
+        "cabinClass": "ECONOMY",
+        "transportTypes": "FLIGHT",
+        "limit": "30",
+        "fromDate": DEPART_DATE_FROM,
+        "toDate": DEPART_DATE_TO,
+        "contentProviders": "KIWI",
+        "sortBy": "QUALITY",
+        "sortOrder": "ASCENDING",
+    }
+    resp = requests.get(url, headers=HEADERS_KIWI, params=params, timeout=90)
+    resp.raise_for_status()
+    data = resp.json()
+    if isinstance(data, dict):
+        if data.get("error"):
+            raise ValueError(str(data.get("error")))
+        if data.get("message") and not data.get("itineraries"):
+            raise ValueError(str(data.get("message")))
+    return data
+
+
+def parse_kiwi_itineraries(route: dict, data: dict) -> list[dict]:
+    out = []
+    for it in data.get("itineraries") or []:
+        sector = it.get("sector") or {}
+        segs = sector.get("sectorSegments") or []
+        if len(segs) != 1:
+            continue  # sadece direkt
+        seg = segs[0].get("segment") or {}
+        if seg.get("type") != "FLIGHT":
+            continue
+
+        src = seg.get("source") or {}
+        dst = seg.get("destination") or {}
+        dep_s = src.get("localTime") or ""
+        arr_s = dst.get("localTime") or ""
+        if not dep_s:
+            continue
+        try:
+            dep = datetime.fromisoformat(dep_s)
+        except ValueError:
+            continue
+        try:
+            arr = datetime.fromisoformat(arr_s) if arr_s else dep
+        except ValueError:
+            arr = dep
+
+        if not in_target_departure_window(dep):
+            continue
+
+        carrier = (seg.get("carrier") or {}).get("name") or "?"
+        price_amt = it.get("price", {}).get("amount")
+        try:
+            price_f = float(price_amt)
+        except (TypeError, ValueError):
+            price_f = 0.0
+        price_fmt = f"{price_f:,.0f} TL".replace(",", ".")
+
+        dur_sec = int(sector.get("duration") or seg.get("duration") or 0)
+        dur_min = max(1, dur_sec // 60)
+
+        booking_url = ""
+        edges = ((it.get("bookingOptions") or {}).get("edges")) or []
+        if edges:
+            node = edges[0].get("node") or {}
+            bu = node.get("bookingUrl") or ""
+            if bu.startswith("http"):
+                booking_url = bu
+            elif bu.startswith("/"):
+                booking_url = "https://www.kiwi.com" + bu
+        if not booking_url:
+            booking_url = fallback_kiwi_search_url(route, dep)
+
+        fid = it.get("id") or f"{carrier}_{dep_s}"
+        out.append({
+            "id": fid,
+            "source_api": "kiwi",
+            "airline": carrier,
+            "departure": dep_s,
+            "arrival": arr_s,
+            "dep_dt": dep,
+            "price": price_f,
+            "price_formatted": price_fmt,
+            "duration_min": dur_min,
+            "booking_url": booking_url,
+            "route_label": route["label"],
+            "from": route["from"],
+            "to": route["to"],
+        })
+    return out
+
+
+# --- Skyscanner (yedek) ---
+
+def extract_sky_buckets(itineraries_data: dict) -> list[dict]:
+    seen = set()
+    items = []
+    for bucket in itineraries_data.get("buckets", []):
+        for item in bucket.get("items", []):
+            iid = item.get("id", "")
+            if iid and iid not in seen:
+                seen.add(iid)
+                items.append(item)
+    return items
+
+
+def poll_sky_incomplete(session_id: str, current: list[dict]) -> list[dict]:
+    url = f"https://{SKY_HOST}/web/flights/search-incomplete"
+    for _ in range(3):
+        time.sleep(3)
+        r = requests.get(url, headers=HEADERS_SKY, params={"sessionId": session_id}, timeout=60)
+        if not r.ok:
+            break
+        data = r.json()
+        if not data.get("status"):
+            break
+        itd = data.get("data", {}).get("itineraries", {})
+        new_items = extract_sky_buckets(itd)
+        if new_items:
+            current = new_items
+        if itd.get("context", {}).get("status") == "complete":
+            break
+    return current
+
+
+def search_sky_oneway(origin: str, destination: str, depart_date: str) -> list[dict]:
+    url = f"https://{SKY_HOST}/web/flights/search-one-way"
+    params = {
+        "placeIdFrom": origin,
+        "placeIdTo": destination,
+        "departDate": depart_date,
+        "currency": "TRY",
+        "market": "TR",
+        "locale": "tr-TR",
+        "cabinClass": "economy",
+        "adults": "1",
+    }
+    resp = requests.get(url, headers=HEADERS_SKY, params=params, timeout=90)
+    resp.raise_for_status()
+    data = resp.json()
+    if not data.get("status"):
+        return []
+    itd = data.get("data", {}).get("itineraries", {})
+    items = extract_sky_buckets(itd)
+    if itd.get("context", {}).get("status") == "incomplete":
+        sid = itd.get("context", {}).get("sessionId", "")
+        if sid:
+            items = poll_sky_incomplete(sid, items)
+    return items
+
+
+def parse_sky_items(route: dict, items: list[dict]) -> list[dict]:
+    out = []
+    for item in items:
+        legs = item.get("legs") or []
+        if not legs:
+            continue
+        leg = legs[0]
+        if leg.get("stopCount", 99) != 0:
+            continue
+        dep_s = leg.get("departure") or ""
+        if not dep_s:
+            continue
+        try:
+            dep = datetime.fromisoformat(dep_s)
+        except ValueError:
+            continue
+        if not in_target_departure_window(dep):
+            continue
+        carriers = (leg.get("carriers") or {}).get("marketing") or []
+        airline = " / ".join(c.get("name", "?") for c in carriers) or "?"
+        po = item.get("price") or {}
+        price_f = float(po.get("raw") or 0)
+        price_fmt = po.get("formatted") or f"{price_f:,.0f} TL"
+        dur = int(leg.get("durationInMinutes") or 0)
+        arr_s = leg.get("arrival") or ""
+        # Genel arama linki (Google Flights)
+        dep_d = dep.astimezone(TURKEY_TZ)
+        q = quote(f"One way {route['from']} to {route['to']} {dep_d.strftime('%Y-%m-%d')}")
+        booking_url = f"https://www.google.com/travel/flights?q={q}"
+
+        out.append({
+            "id": item.get("id") or f"{airline}_{dep_s}",
+            "source_api": "sky",
+            "airline": airline,
+            "departure": dep_s,
+            "arrival": arr_s,
+            "dep_dt": dep,
+            "price": price_f,
+            "price_formatted": price_fmt,
+            "duration_min": dur,
+            "booking_url": booking_url,
+            "route_label": route["label"],
+            "from": route["from"],
+            "to": route["to"],
+        })
+    return out
+
+
+def fetch_route_flights(route: dict) -> tuple[list[dict], str]:
+    """
+    Önce Kiwi; hedef pencerede sonuç yoksa Skyscanner.
+    Dönüş: (flights, notes)
+    """
+    notes = []
     try:
-        flights = search_route(route)
-    except requests.exceptions.RequestException as e:
-        print(f"API error for {route['label']}: {e}")
-        return [f"⚠️ {route['label']}: API hatası — {e}"], {}, 0
+        raw = search_kiwi_route(route)
+        flights = parse_kiwi_itineraries(route, raw)
+        if flights:
+            notes.append("Kaynak: Kiwi.com")
+            return flights, " ".join(notes)
+        notes.append("Kiwi sonuç vermedi veya tarih penceresiyle eşleşmedi.")
+    except requests.HTTPError as e:
+        notes.append(f"Kiwi HTTP hatası: {e}")
+    except ValueError as e:
+        notes.append(f"Kiwi yanıt hatası: {e}")
+    except requests.RequestException as e:
+        notes.append(f"Kiwi istek hatası: {e}")
 
-    changes = []
-    new_entries = {}
+    # Yedek: Skyscanner — tarih başına ayrı istek
+    all_sky = []
+    for d in DEPART_DATES:
+        try:
+            items = search_sky_oneway(route["from"], route["to"], d)
+            all_sky.extend(items)
+        except requests.RequestException as e:
+            notes.append(f"Sky {d}: {e}")
+        time.sleep(2)
+    flights = parse_sky_items(route, all_sky)
+    notes.append("Kaynak: Skyscanner (yedek)")
+    return flights, " ".join(notes)
 
-    for item in flights:
-        info = extract_flight_info(item)
-        flight_key = f"{route_key_prefix}_{info['airline']}_{info['departure']}"
-        old = cache.get(flight_key)
 
-        new_entries[flight_key] = {
-            "price": info["price"],
-            "price_formatted": info["price_formatted"],
-            "airline": info["airline"],
-            "departure": info["departure"],
-            "arrival": info["arrival"],
-            "duration": info["duration"],
-            "last_checked": datetime.now(TURKEY_TZ).isoformat(),
-        }
+def price_delta_note(cache: dict, key: str, price: float) -> str:
+    old = cache.get(key)
+    if old is None:
+        return "<i>(yeni)</i>"
+    old_p = old.get("price")
+    if old_p is None:
+        return ""
+    if abs(old_p - price) < 0.5:
+        return "<i>(değişiklik yok)</i>"
+    diff = price - old_p
+    if diff < 0:
+        return f"<i>(📉 {diff:,.0f} TL)</i>".replace(",", ".")
+    return f"<i>(📈 +{diff:,.0f} TL)</i>".replace(",", ".")
 
-        dep_display = format_time(info["departure"])
-        arr_display = format_time(info["arrival"])
-        dur_text = format_duration(info["duration"])
 
-        if old is None:
-            changes.append(
-                f"  🆕 <b>{info['airline']}</b>\n"
-                f"     📅 {dep_display} → {arr_display} | ⏱ {dur_text}\n"
-                f"     💰 {info['price_formatted']}"
-            )
-        elif old["price"] != info["price"]:
-            diff = info["price"] - old["price"]
-            if diff < 0:
-                icon = "📉"
-                diff_text = f"-{abs(diff):.0f} TL"
-            else:
-                icon = "📈"
-                diff_text = f"+{diff:.0f} TL"
-            changes.append(
-                f"  {icon} <b>{info['airline']}</b>\n"
-                f"     📅 {dep_display} → {arr_display} | ⏱ {dur_text}\n"
-                f"     💰 {old['price_formatted']} → {info['price_formatted']} ({diff_text})"
-            )
+def format_flight_block(idx: int, f: dict, cache: dict, route_prefix: str) -> str:
+    key = f"{route_prefix}_{f['airline']}_{f['departure']}"
+    dep = format_time_dt(f["dep_dt"])
+    arr = ""
+    if f.get("arrival"):
+        try:
+            arr = format_time_dt(datetime.fromisoformat(f["arrival"]))
+        except ValueError:
+            arr = f.get("arrival", "")[:16]
+    dur = format_duration_minutes(f["duration_min"])
+    delta = price_delta_note(cache, key, f["price"])
+    src = "Kiwi" if f["source_api"] == "kiwi" else "Sky"
+    link = f.get("booking_url") or "https://www.kiwi.com/tr/"
+    href = link.replace("&", "&amp;")
+    return (
+        f"{idx}. <b>{f['airline']}</b> <code>[{src}]</code>\n"
+        f"   📅 {dep} → {arr} | ⏱ {dur}\n"
+        f"   💰 <b>{f['price_formatted']}</b> {delta}\n"
+        f'   <a href="{href}">Rezervasyon / detay</a>'
+    )
 
-    old_route_keys = {k for k in cache if k.startswith(route_key_prefix + "_")}
-    removed = old_route_keys - set(new_entries.keys())
-    for key in removed:
-        old = cache[key]
-        dep_display = format_time(old["departure"])
-        changes.append(
-            f"  ❌ <b>{old['airline']}</b> — {dep_display} | {old['price_formatted']} KALDIRILDI"
-        )
 
-    return changes, new_entries, len(flights)
+def build_report(sections: list[str], footer: str) -> str:
+    msg = "<b>✈️ Saatlik uçuş raporu</b>\n\n"
+    msg += "\n\n".join(sections)
+    msg += f"\n\n{'—' * 12}\n{footer}"
+    return msg
 
 
 def main():
-    print(f"[{datetime.now(TURKEY_TZ).isoformat()}] Checking flights...")
+    now = datetime.now(TURKEY_TZ).strftime("%d/%m/%Y %H:%M")
+    print(f"[{now}] Checking flights...")
 
     notify_state = load_notify_state()
     if not notify_state.get("intro_sent"):
         send_telegram(INTRO_MESSAGE)
         notify_state["intro_sent"] = True
         save_notify_state(notify_state)
-        print("Sent intro message")
 
     cache = load_cache()
-    new_cache = {}
+    new_cache: dict = {}
+
     all_sections = []
-    total_flights = 0
-    has_changes = False
+    total = 0
 
     for route in ROUTES:
-        changes, new_entries, flight_count = process_route(route, cache)
-        new_cache.update(new_entries)
-        total_flights += flight_count
+        prefix = f"{route['from']}_{route['to']}"
+        try:
+            flights, src_note = fetch_route_flights(route)
+        except Exception as e:
+            all_sections.append(
+                f"<b>{route['label']}</b>\n⚠️ Hata: {e}"
+            )
+            continue
 
-        section_header = f"<b>{'—' * 20}</b>\n<b>✈️ {route['label']}</b>"
+        flights.sort(key=lambda x: (x["dep_dt"], x["price"]))
+        total += len(flights)
 
-        if changes:
-            has_changes = True
-            section = section_header + f"\n<i>{flight_count} direkt uçuş</i>\n\n" + "\n\n".join(changes)
+        lines = [f"<b>{route['label']}</b>", f"<i>{src_note}</i>", f"<i>{len(flights)} direkt uçuş</i>", ""]
+        if not flights:
+            lines.append("<i>Bu pencerede direkt uçuş bulunamadı.</i>")
         else:
-            section = section_header + f"\n✅ Değişiklik yok ({flight_count} direkt uçuş)"
+            for i, f in enumerate(flights, 1):
+                lines.append(format_flight_block(i, f, cache, prefix))
+                key = f"{prefix}_{f['airline']}_{f['departure']}"
+                new_cache[key] = {
+                    "price": f["price"],
+                    "price_formatted": f["price_formatted"],
+                    "airline": f["airline"],
+                    "departure": f["departure"],
+                    "source_api": f["source_api"],
+                    "last_checked": datetime.now(TURKEY_TZ).isoformat(),
+                }
+        all_sections.append("\n".join(lines))
 
-        all_sections.append(section)
-
-    now = datetime.now(TURKEY_TZ).strftime("%d/%m %H:%M")
-
-    msg = "<b>✈️ Uçuş Fiyat Kontrol Raporu</b>\n\n"
-    msg += "\n\n".join(all_sections)
-    msg += f"\n\n{'—' * 20}\n🕐 Kontrol: {now} | Toplam: {total_flights} direkt uçuş"
-
-    print(f"Sending combined notification (changes: {has_changes})")
-    send_telegram(msg)
+    footer = f"🕐 Kontrol: {now} | Toplam {total} direkt uçuş"
+    report = build_report(all_sections, footer)
+    send_telegram_long(report)
 
     save_cache(new_cache)
-    print("Cache updated successfully")
+    print("Done.")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except requests.HTTPError as e:
+        msg = f"⚠️ HTTP hatası: {e}"
+        print(msg)
+        send_telegram(msg)
+        sys.exit(1)
